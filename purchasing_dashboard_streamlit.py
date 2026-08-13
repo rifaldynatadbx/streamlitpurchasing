@@ -546,22 +546,37 @@ def apply_app_style(dark_mode: bool) -> None:
 # =========================================================
 def normalize_col(col: object) -> str:
     """
-    Membersihkan nama kolom Excel.
+    Membersihkan nama kolom Excel / Google Sheets.
+
+    Kolom tanpa judul (sel header kosong) bisa muncul dalam
+    beberapa bentuk tergantung sumbernya: `None` (Excel via
+    openpyxl), teks "Unnamed: N" (pandas auto-naming untuk sel
+    header kosong), atau string kosong "" (Google Sheets).
+    Semuanya distandarkan jadi "unnamed" supaya konsisten dibuang
+    oleh filter kolom di `prepare_dataframe`.
     """
 
     if col is None:
         return "unnamed"
 
-    if str(col).strip().lower() == "none":
+    text = str(col).strip()
+
+    if text == "" or text.lower() == "none":
         return "unnamed"
 
-    col = str(col).strip()
-    col = col.replace("\n", " ")
+    if re.match(
+        r"^unnamed(:\s*\d+)?$",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "unnamed"
+
+    text = text.replace("\n", " ")
 
     return re.sub(
         r"\s+",
         " ",
-        col,
+        text,
     )
 
 
@@ -1072,14 +1087,33 @@ def load_data_from_gsheet(
     spreadsheet = client.open_by_key(sheet_id)
     worksheet = spreadsheet.worksheet(worksheet_name)
 
-    records = worksheet.get_all_records(
-        head=header_row,
-    )
+    # Sengaja pakai get_all_values() (nilai mentah), bukan
+    # get_all_records() — get_all_records() melempar error kalau
+    # ada header kosong/duplikat (kasus umum kalau di Sheet ada
+    # kolom pemisah/kosong). Header kosong/duplikat di sini
+    # ditangani dengan cara yang sama seperti kolom "Unnamed" di
+    # jalur Excel: dibuang lewat `prepare_dataframe`.
+    all_values = worksheet.get_all_values()
 
-    if not records:
+    if len(all_values) < header_row:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
+    header = all_values[header_row - 1]
+    data_rows = all_values[header_row:]
+
+    if not data_rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(
+        data_rows,
+        columns=header,
+    )
+
+    # Sel kosong dari Google Sheets datang sebagai string ""
+    # (bukan NaN asli seperti sel kosong di Excel) — disamakan
+    # dulu supaya deteksi baris/kolom kosong di prepare_dataframe
+    # bekerja sama seperti pada file Excel.
+    df = df.replace("", np.nan)
 
     return prepare_dataframe(df)
 
