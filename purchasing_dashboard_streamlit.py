@@ -10,6 +10,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    GSPREAD_AVAILABLE = True
+
+except ImportError:
+    GSPREAD_AVAILABLE = False
+
 
 # =========================================================
 # PAGE CONFIGURATION
@@ -686,6 +695,21 @@ def load_data(
 
     df = read_raw_data_sheet(source)
 
+    return prepare_dataframe(df)
+
+
+def prepare_dataframe(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Membersihkan & menyiapkan dataframe mentah (dari Excel
+    maupun Google Sheets) menjadi dataset siap pakai dashboard.
+
+    Dipisah dari `load_data` supaya logika pembersihan yang
+    sama bisa dipakai ulang oleh sumber data mana pun (Excel
+    upload, file lokal, atau Google Sheets), tanpa duplikasi.
+    """
+
     df.columns = [
         normalize_col(col)
         for col in df.columns
@@ -971,6 +995,93 @@ def load_combined_data(
     )
 
     return combined
+
+
+# =========================================================
+# GOOGLE SHEETS SOURCE (auto-sync, tanpa upload manual)
+# =========================================================
+GOOGLE_SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+
+def gsheet_is_configured() -> bool:
+    """
+    Mengecek apakah kredensial & ID Google Sheet sudah
+    disiapkan di Streamlit Secrets (Manage app -> Settings ->
+    Secrets). Kalau belum, dashboard otomatis jatuh ke sumber
+    lain (upload manual / file lokal) tanpa error.
+    """
+
+    if not GSPREAD_AVAILABLE:
+        return False
+
+    try:
+        return (
+            "gcp_service_account" in st.secrets
+            and "gsheet_id" in st.secrets
+        )
+
+    except Exception:
+        return False
+
+
+def get_gsheet_client():
+    """
+    Membuat client Google Sheets dari service account yang
+    disimpan di Streamlit Secrets. Kredensial ini tidak pernah
+    terlihat oleh user dashboard, hanya dibaca dari server.
+    """
+
+    credentials_info = dict(
+        st.secrets["gcp_service_account"]
+    )
+
+    credentials = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=GOOGLE_SHEETS_SCOPES,
+    )
+
+    return gspread.authorize(credentials)
+
+
+@st.cache_data(
+    ttl=300,
+    show_spinner="Syncing latest data from Google Sheets...",
+)
+def load_data_from_gsheet(
+    sheet_id: str,
+    worksheet_name: str = "RAW DATA",
+    header_row: int = 1,
+) -> pd.DataFrame:
+    """
+    Membaca data purchasing langsung dari Google Sheets, lalu
+    memprosesnya lewat pipeline pembersihan yang sama dengan
+    file Excel (`prepare_dataframe`).
+
+    Hasilnya di-cache 5 menit (`ttl=300`) supaya dashboard tidak
+    memanggil Google Sheets API di setiap interaksi user, tapi
+    tetap otomatis dapat data terbaru tanpa perlu redeploy.
+    Tombol "Refresh data" di sidebar bisa memaksa ambil versi
+    terbaru sebelum 5 menit itu berakhir.
+    """
+
+    client = get_gsheet_client()
+
+    spreadsheet = client.open_by_key(sheet_id)
+    worksheet = spreadsheet.worksheet(worksheet_name)
+
+    records = worksheet.get_all_records(
+        head=header_row,
+    )
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    return prepare_dataframe(df)
 
 
 # =========================================================
@@ -6641,11 +6752,22 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    gsheet_ready = gsheet_is_configured()
+
     uploaded_files = (
         st.sidebar.file_uploader(
             "Upload purchasing workbook(s)",
             type=["xlsx"],
             accept_multiple_files=True,
+            help=(
+                (
+                    "Opsional — kalau tidak upload apa pun, "
+                    "dashboard otomatis pakai data yang sudah "
+                    "tersinkron dari Google Sheets."
+                )
+                if gsheet_ready
+                else None
+            ),
         )
     )
 
@@ -6654,6 +6776,10 @@ def main() -> None:
     file_path = None
     combine_mode = False
     named_file_bytes = None
+    use_gsheet = False
+    gsheet_id = None
+    gsheet_worksheet = "RAW DATA"
+    gsheet_header_row = 1
 
     if uploaded_files:
         file_lookup = {
@@ -6737,6 +6863,40 @@ def main() -> None:
                 f"Active source: {selected_name}"
             )
 
+    elif gsheet_ready:
+        use_gsheet = True
+        gsheet_id = st.secrets["gsheet_id"]
+
+        gsheet_worksheet = st.secrets.get(
+            "gsheet_worksheet_name",
+            "RAW DATA",
+        )
+
+        gsheet_header_row = int(
+            st.secrets.get(
+                "gsheet_header_row",
+                1,
+            )
+        )
+
+        st.sidebar.success(
+            "Live source: Google Sheets (auto-sync)"
+        )
+
+        st.sidebar.caption(
+            "Data disegarkan otomatis tiap 5 menit. "
+            "Baru saja update Sheet-nya? Klik refresh "
+            "di bawah supaya langsung kebaca."
+        )
+
+        if st.sidebar.button(
+            "🔄 Refresh data sekarang",
+            key="refresh_gsheet",
+            use_container_width=True,
+        ):
+            load_data_from_gsheet.clear()
+            st.rerun()
+
     elif DEFAULT_FILE.exists():
         file_path = str(
             DEFAULT_FILE
@@ -6753,8 +6913,9 @@ def main() -> None:
         st.info(
             (
                 "Upload one or more Excel workbooks containing "
-                "the `RAW DATA` sheet. "
-                "The header is expected on row 2."
+                "the `RAW DATA` sheet (header on row 2), or "
+                "connect a Google Sheet as the live data source "
+                "via Streamlit Secrets."
             )
         )
         return
@@ -6768,6 +6929,14 @@ def main() -> None:
                     for name, _ in named_file_bytes
                 )
             ),
+        )
+
+    elif use_gsheet:
+        data_fingerprint = (
+            "gsheet",
+            gsheet_id,
+            gsheet_worksheet,
+            gsheet_header_row,
         )
 
     elif file_path:
@@ -6824,6 +6993,13 @@ def main() -> None:
                     named_file_bytes
                 )
 
+            elif use_gsheet:
+                df = load_data_from_gsheet(
+                    gsheet_id,
+                    gsheet_worksheet,
+                    gsheet_header_row,
+                )
+
             else:
                 df = load_data(
                     file_bytes,
@@ -6846,11 +7022,18 @@ def main() -> None:
         return
 
     except Exception as error:
-        st.error(
-            (
+        message = (
+            "Unable to read the Google Sheet. "
+            f"Detail: {error}"
+            if use_gsheet
+            else (
                 "Unable to read the workbook. "
                 f"Detail: {error}"
             )
+        )
+
+        st.error(
+            message
         )
         return
 
