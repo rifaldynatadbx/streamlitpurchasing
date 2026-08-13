@@ -1222,6 +1222,15 @@ def to_excel_bytes(
                         .quantile(0.90)
                     )
 
+                    # Kolom yang isinya kosong semua (NaN semua)
+                    # membuat quantile() ikut menghasilkan NaN di
+                    # sebagian versi pandas, jadi perlu fallback
+                    # supaya int() di bawah tidak error.
+                    if pd.isna(sample_length):
+                        sample_length = len(
+                            col_name
+                        )
+
                 else:
                     sample_length = len(
                         col_name
