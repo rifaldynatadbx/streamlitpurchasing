@@ -85,6 +85,25 @@ MONTH_ORDER = {
 
 
 # =========================================================
+# MONTH ABBREVIATION (for MMM-YYYY display label)
+# =========================================================
+MONTH_ABBR = {
+    1: "Jan",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "May",
+    6: "Jun",
+    7: "Jul",
+    8: "Aug",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+
+
+# =========================================================
 # SOURCE COLUMN MAPPING
 # =========================================================
 REQUIRED_COLUMNS = {
@@ -554,6 +573,60 @@ def month_to_no(value: object) -> float:
     return np.nan
 
 
+def normalize_month_label(value: object) -> object:
+    """
+    Menstandarkan kolom label bulan (mis. Costing Month,
+    Payment Schedule Month) menjadi teks 'MMM-YYYY'
+    (contoh: 'Jan-2025').
+
+    Sumbernya bisa berupa:
+    - nama bulan sebagai teks (mis. "Januari 2025"); atau
+    - tanggal Excel asli (kolom sumber ke-format sebagai Date,
+      bukan Text — kasus umum kalau orang mengetik "Jan-25"
+      tanpa memaksa format Text di Excel, sehingga Excel diam-
+      diam mengubahnya jadi tanggal).
+
+    Kedua kasus di atas distandarkan ke format yang sama supaya
+    pencocokan bulan (`month_to_no`) dan tampilan di layar/Excel
+    tetap konsisten, apa pun format sumbernya.
+    """
+
+    if pd.isna(value):
+        return pd.NA
+
+    if isinstance(value, datetime):
+        return f"{MONTH_ABBR[value.month]}-{value.year}"
+
+    text = str(value).strip()
+
+    if not text:
+        return pd.NA
+
+    month_no = month_to_no(text)
+    year_match = re.search(r"(19|20)\d{2}", text)
+
+    if not pd.isna(month_no) and year_match:
+        return f"{MONTH_ABBR[int(month_no)]}-{year_match.group(0)}"
+
+    # Fallback: teks ini kemungkinan hasil `astype(str)` dari
+    # kolom yang ke-detect sebagai Date oleh Excel/pandas
+    # (contoh: "2025-01-15" atau "2025-01-15 00:00:00").
+    #
+    # `year_match` disyaratkan juga di sini supaya nama bulan
+    # polos tanpa tahun (mis. "January") tidak salah diparse
+    # oleh pandas jadi tanggal tahun 1 (0001-01-01).
+    if year_match:
+        parsed = pd.to_datetime(
+            text,
+            errors="coerce",
+        )
+
+        if pd.notna(parsed):
+            return f"{MONTH_ABBR[parsed.month]}-{parsed.year}"
+
+    return text
+
+
 def read_raw_data_sheet(
     source: object,
 ) -> pd.DataFrame:
@@ -653,8 +726,6 @@ def load_data(
         "item_category",
         "item_description",
         "unit",
-        "costing_month",
-        "payment_schedule_month",
         "pr_no",
         "po_no",
     ]
@@ -673,6 +744,23 @@ def load_data(
                 "None": pd.NA,
                 "": pd.NA,
             })
+
+    # Kolom label bulan ditangani terpisah (bukan lewat text_cols
+    # di atas) supaya nilai tanggal asli Excel (kalau sumbernya
+    # ke-format sebagai Date, bukan Text) tetap bisa dibaca
+    # dengan benar, lalu distandarkan jadi teks "MMM-YYYY".
+    month_label_cols = [
+        "costing_month",
+        "payment_schedule_month",
+    ]
+
+    for col in month_label_cols:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .apply(normalize_month_label)
+                .astype("string")
+            )
 
     uppercase_cols = [
         "cost_category",
@@ -824,8 +912,27 @@ def load_data(
             .apply(month_to_no)
         )
 
+        costing_year = (
+            df["costing_month"]
+            .astype("string")
+            .str.extract(
+                r"((?:19|20)\d{2})",
+                expand=False,
+            )
+            .astype("Float64")
+        )
+
+        # Dipakai untuk mengurutkan tren bulanan secara
+        # kronologis (bukan cuma 1-12) supaya data yang
+        # melewati pergantian tahun tidak tercampur urutannya.
+        df["month_sort_key"] = (
+            costing_year * 12
+            + df["month_no"]
+        )
+
     else:
         df["month_no"] = np.nan
+        df["month_sort_key"] = np.nan
 
     return df
 
@@ -1964,6 +2071,60 @@ def executive_datasets(
     )
 
     if (
+        not monthly.empty
+        and "month_no" in monthly.columns
+        and "month_sort_key" in df.columns
+    ):
+        # Ambil month_sort_key (tahun x 12 + bulan) lewat left-
+        # merge, bukan dijadikan kolom group langsung — supaya
+        # baris yang label bulannya tidak menyebut tahun (mis.
+        # cuma "Januari" tanpa tahun) tetap ikut, bukan malah
+        # ke-drop dari grouping.
+        sort_key_lookup = (
+            df[
+                [
+                    "month_no",
+                    "costing_month",
+                    "month_sort_key",
+                ]
+            ]
+            .dropna(
+                subset=[
+                    "month_no",
+                    "costing_month",
+                ]
+            )
+            .drop_duplicates(
+                subset=[
+                    "month_no",
+                    "costing_month",
+                ]
+            )
+        )
+
+        monthly = monthly.merge(
+            sort_key_lookup,
+            on=[
+                "month_no",
+                "costing_month",
+            ],
+            how="left",
+        )
+
+        # Kalau tahunnya tidak terdeteksi, fallback ke urutan
+        # per nomor bulan saja (perilaku lama) daripada dibuang.
+        monthly["month_sort_key"] = (
+            monthly["month_sort_key"]
+            .fillna(
+                monthly["month_no"]
+            )
+        )
+
+        monthly = monthly.sort_values(
+            "month_sort_key"
+        )
+
+    elif (
         not monthly.empty
         and "month_no" in monthly.columns
     ):
@@ -5940,7 +6101,7 @@ def show_detail_data(
     default_columns = [
         col
         for col in all_columns
-        if col not in ("month_no",)
+        if col not in ("month_no", "month_sort_key")
     ]
 
     selected_columns = st.multiselect(
