@@ -6475,8 +6475,71 @@ def show_po_lookup(
 
     df = render_local_filters(df, "polookup")
 
+    # Bisa cari lewat Nomor PO, tapi juga lewat Nomor PR, Vendor,
+    # atau Nama Barang — supaya tetap bisa ketemu PO-nya meski
+    # user belum tahu nomor PO-nya, cuma ingat nama barangnya.
+    po_search_columns = [
+        col
+        for col in [
+            "po_no",
+            "pr_no",
+            "vendor",
+            "item_description",
+            "item_category",
+        ]
+        if col in df.columns
+    ]
+
+    search_term = st.text_input(
+        "Cari Nomor PO, Nomor PR, Vendor, atau Nama Barang",
+        value="",
+        placeholder=(
+            "Ketik nomor PO/PR, nama vendor, atau nama barang "
+            "— tidak perlu tahu nomor PO-nya dulu..."
+        ),
+        key="po_lookup_search_term",
+    )
+
+    # Kalau kata pencariannya berubah, daftar Nomor PO yang cocok
+    # ikut berubah — reset PO yang tadinya terpilih supaya tidak
+    # nyangkut pada nilai yang sudah tidak ada di daftar baru
+    # (yang bisa bikin selectbox-nya error).
+    previous_search_term = st.session_state.get(
+        "po_lookup_prev_search"
+    )
+
+    if previous_search_term != search_term:
+        st.session_state.pop(
+            "po_lookup_selected",
+            None,
+        )
+
+    st.session_state.po_lookup_prev_search = search_term
+
+    search_scope = df
+
+    if search_term and po_search_columns:
+        mask = pd.Series(
+            False,
+            index=df.index,
+        )
+
+        for col in po_search_columns:
+            mask = mask | (
+                df[col]
+                .astype(str)
+                .str.contains(
+                    search_term,
+                    case=False,
+                    na=False,
+                    regex=False,
+                )
+            )
+
+        search_scope = df[mask]
+
     po_options = sorted(
-        df["po_no"]
+        search_scope["po_no"]
         .dropna()
         .astype(str)
         .unique()
@@ -6484,18 +6547,41 @@ def show_po_lookup(
     )
 
     if not po_options:
+        message = (
+            (
+                "Tidak ada Nomor PO yang cocok dengan pencarian "
+                f"\"{search_term}\"."
+            )
+            if search_term
+            else "Tidak ada Nomor PO pada data hasil filter saat ini."
+        )
+
         st.info(
-            "Tidak ada Nomor PO pada data hasil filter saat ini."
+            message
         )
         return
 
+    # Kalau pencarian item/vendor/PR cuma nemu satu PO, langsung
+    # pilihkan otomatis supaya user tidak perlu klik lagi.
+    auto_select_index = (
+        0
+        if search_term and len(po_options) == 1
+        else None
+    )
+
     selected_po = st.selectbox(
-        "Pilih atau ketik Nomor PO",
+        "Pilih Nomor PO",
         options=po_options,
-        index=None,
-        placeholder="Contoh: ketik sebagian nomor PO untuk mencari...",
+        index=auto_select_index,
+        placeholder="Ketik sebagian nomor PO untuk mencari lebih lanjut...",
         key="po_lookup_selected",
     )
+
+    if search_term:
+        st.caption(
+            f"{number_id(len(po_options))} Nomor PO cocok dengan "
+            f"pencarian \"{search_term}\"."
+        )
 
     if not selected_po:
         st.info(
@@ -6737,8 +6823,15 @@ def show_po_lookup(
 
     reading_guide([
         (
-            "Ketik sebagian Nomor PO pada kotak pilihan untuk "
-            "mencari dengan cepat, tidak perlu scroll daftar panjang."
+            "Belum tahu Nomor PO-nya? Ketik nama barang, nama "
+            "vendor, atau Nomor PR di kotak pencarian paling "
+            "atas — daftar Nomor PO di bawahnya otomatis "
+            "menyempit ke yang cocok saja."
+        ),
+        (
+            "Kalau pencarian hanya cocok dengan satu Nomor PO, "
+            "riwayatnya langsung terpilih otomatis tanpa perlu "
+            "klik lagi."
         ),
         (
             "Timeline menunjukkan urutan tanggal aktual PO ini — "
