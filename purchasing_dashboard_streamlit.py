@@ -1093,7 +1093,19 @@ def load_data_from_gsheet(
     # kolom pemisah/kosong). Header kosong/duplikat di sini
     # ditangani dengan cara yang sama seperti kolom "Unnamed" di
     # jalur Excel: dibuang lewat `prepare_dataframe`.
-    all_values = worksheet.get_all_values()
+    # `value_render_option="UNFORMATTED_VALUE"` penting: tanpa ini,
+    # Google Sheets mengirim angka sebagai TEKS TAMPILAN (mis.
+    # "12,500,000" lengkap dengan pemisah ribuan), yang gagal
+    # dibaca `pd.to_numeric` dan diam-diam jadi kosong — bikin
+    # total spend di dashboard jatuh jauh lebih kecil dari
+    # aslinya. Dengan opsi ini, angka dikirim sebagai angka asli.
+    # `date_time_render_option="FORMATTED_STRING"` supaya kolom
+    # tanggal tetap dikirim sebagai teks yang bisa dibaca
+    # (mis. "1/15/2025"), bukan berubah jadi serial number.
+    all_values = worksheet.get_all_values(
+        value_render_option="UNFORMATTED_VALUE",
+        date_time_render_option="FORMATTED_STRING",
+    )
 
     if len(all_values) < header_row:
         return pd.DataFrame()
